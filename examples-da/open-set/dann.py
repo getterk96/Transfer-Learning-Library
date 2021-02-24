@@ -3,37 +3,38 @@ import time
 import warnings
 import sys
 import argparse
-import copy
-from typing import Sequence
+import shutil
+import os.path as osp
 
 import torch
-import torch.nn.parallel
+import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import LambdaLR
-import torch.utils.data
 from torch.utils.data import DataLoader
-import torch.utils.data.distributed
-import torchvision.transforms as transforms
+import torchvision.transforms as T
 import torch.nn.functional as F
-from PIL import Image
 
-sys.path.append('.')
+sys.path.append('../..')
 from dalib.modules.domain_discriminator import DomainDiscriminator
-from dalib.adaptation.dann import DomainAdversarialLoss, ImageClassifier
 from dalib.modules.classifier import Classifier
-import dalib.vision.datasets as datasets
-from dalib.vision.datasets.opensetda import default_open_set as open_set
+from dalib.adaptation.dann import DomainAdversarialLoss, ImageClassifier
+import dalib.vision.datasets.openset as datasets
+from dalib.vision.datasets.openset import default_open_set as open_set
 import dalib.vision.models as models
+from dalib.vision.transforms import ResizeImage
 from dalib.utils.data import ForeverDataIterator
-from dalib.utils.metric import accuracy
-from dalib.utils.avgmeter import AverageMeter, ProgressMeter, ClassWiseAccuracyMeter
-
+from dalib.utils.metric import accuracy, ConfusionMatrix
+from dalib.utils.meter import AverageMeter, ProgressMeter
+from dalib.utils.logger import CompleteLogger
+from dalib.utils.analysis import collect_feature, tsne, a_distance
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def main(args: argparse.Namespace):
+    logger = CompleteLogger(args.log, args.phase)
+
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -47,18 +48,27 @@ def main(args: argparse.Namespace):
     cudnn.benchmark = True
 
     # Data loading code
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    train_transform = transforms.Compose([
-        transforms.Resize((256, 256), Image.CUBIC),
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize
-    ])
-    val_transform = transforms.Compose([
-        transforms.Resize((256, 256), Image.CUBIC),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
+    normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    if args.center_crop:
+        train_transform = T.Compose([
+            ResizeImage(256),
+            T.CenterCrop(224),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            normalize
+        ])
+    else:
+        train_transform = T.Compose([
+            ResizeImage(256),
+            T.RandomResizedCrop(224),
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),
+            normalize
+        ])
+    val_transform = T.Compose([
+        ResizeImage(256),
+        T.CenterCrop(224),
+        T.ToTensor(),
         normalize
     ])
 
@@ -99,27 +109,50 @@ def main(args: argparse.Namespace):
     # define loss function
     domain_adv = DomainAdversarialLoss(domain_discri).to(device)
 
+    # analysis the model
+    if args.phase == 'analysis':
+        # extract features from both domains
+        feature_extractor = nn.Sequential(classifier.backbone, classifier.bottleneck).to(device)
+        source_feature = collect_feature(train_source_loader, feature_extractor, device)
+        target_feature = collect_feature(train_target_loader, feature_extractor, device)
+        # plot t-SNE
+        tSNE_filename = osp.join(logger.visualize_directory, 'TSNE.png')
+        tsne.visualize(source_feature, target_feature, tSNE_filename)
+        print("Saving t-SNE to", tSNE_filename)
+        # calculate A-distance, which is a measure for distribution discrepancy
+        A_distance = a_distance.calculate(source_feature, target_feature, device)
+        print("A-distance =", A_distance)
+        return
+
+    if args.phase == 'test':
+        acc1 = validate(test_loader, classifier, args)
+        print(acc1)
+        return
+
     # start training
-    best_acc1 = 0.
+    best_h_score = 0.
     for epoch in range(args.epochs):
         # train for one epoch
         train(train_source_iter, train_target_iter, classifier, domain_adv, optimizer,
               lr_scheduler, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(test_loader, classifier, args, val_dataset.classes)
+        h_score = validate(val_loader, classifier, args)
 
         # remember best acc@1 and save checkpoint
-        if acc1 > best_acc1:
-            best_model = copy.deepcopy(classifier.state_dict())
-        best_acc1 = max(acc1, best_acc1)
+        torch.save(classifier.state_dict(), logger.get_checkpoint_path('latest'))
+        if h_score > best_h_score:
+            shutil.copy(logger.get_checkpoint_path('latest'), logger.get_checkpoint_path('best'))
+        best_h_score = max(h_score, best_h_score)
 
-    print("best_acc1 = {:3.1f}".format(best_acc1))
+    print("best_h_score = {:3.1f}".format(best_h_score))
 
     # evaluate on test set
-    classifier.load_state_dict(best_model)
-    acc1 = validate(test_loader, classifier, args, val_dataset.classes)
-    print("test_acc1 = {:3.1f}".format(acc1))
+    classifier.load_state_dict(torch.load(logger.get_checkpoint_path('best')))
+    h_score = validate(test_loader, classifier, args)
+    print("test_h_score = {:3.1f}".format(h_score))
+
+    logger.close()
 
 
 def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
@@ -142,9 +175,6 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
 
     end = time.time()
     for i in range(args.iters_per_epoch):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
         x_s, labels_s = next(train_source_iter)
         x_t, labels_t = next(train_target_iter)
 
@@ -152,6 +182,9 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         x_t = x_t.to(device)
         labels_s = labels_s.to(device)
         labels_t = labels_t.to(device)
+
+        # measure data loading time
+        data_time.update(time.time() - end)
 
         # compute output
         x = torch.cat((x_s, x_t), dim=0)
@@ -186,12 +219,13 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
             progress.display(i)
 
 
-def validate(val_loader: DataLoader, model: Classifier, args: argparse.Namespace, classes: Sequence) -> float:
+def validate(val_loader: DataLoader, model: Classifier, args: argparse.Namespace) -> float:
     batch_time = AverageMeter('Time', ':6.3f')
-    accuracy_meter = ClassWiseAccuracyMeter(classes, ':6.2f')
+    classes = val_loader.dataset.classes
+    confmat = ConfusionMatrix(len(classes))
     progress = ProgressMeter(
         len(val_loader),
-        [batch_time, accuracy_meter],
+        [batch_time],
         prefix='Test: ')
 
     # switch to evaluate mode
@@ -209,7 +243,7 @@ def validate(val_loader: DataLoader, model: Classifier, args: argparse.Namespace
             softmax_output[:, -1] = args.threshold
 
             # measure accuracy and record loss
-            accuracy_meter.update(softmax_output, target)
+            confmat.update(target, softmax_output.argmax(1))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -218,14 +252,18 @@ def validate(val_loader: DataLoader, model: Classifier, args: argparse.Namespace
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        all_acc = accuracy_meter.average_accuracy(classes)
-        known = accuracy_meter.average_accuracy(classes[:-1])
-        unknown = accuracy_meter.accuracy(classes[-1])
+        acc_global, accs, iu = confmat.compute()
+        all_acc = torch.mean(accs).item() * 100
+        known = torch.mean(accs[:-1]).item() * 100
+        unknown = accs[-1].item() * 100
         h_score = 2 * known * unknown / (known + unknown)
+        if args.per_class_eval:
+            print(confmat.format(classes))
         print(' * All {all:.3f} Known {known:.3f} Unknown {unknown:.3f} H-score {h_score:.3f}'
               .format(all=all_acc, known=known, unknown=unknown, h_score=h_score))
 
     return h_score
+
 
 if __name__ == '__main__':
     architecture_names = sorted(
@@ -239,6 +277,7 @@ if __name__ == '__main__':
     )
 
     parser = argparse.ArgumentParser(description='PyTorch Domain Adaptation')
+    # dataset parameters
     parser.add_argument('root', metavar='DIR',
                         help='root path of dataset')
     parser.add_argument('-d', '--data', metavar='DATA', default='Office31',
@@ -246,15 +285,22 @@ if __name__ == '__main__':
                              ' (default: Office31)')
     parser.add_argument('-s', '--source', help='source domain(s)')
     parser.add_argument('-t', '--target', help='target domain(s)')
+    parser.add_argument('--center-crop', default=False, action='store_true',
+                        help='whether use center crop during training')
+    # model parameters
     parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                         choices=architecture_names,
                         help='backbone architecture: ' +
                              ' | '.join(architecture_names) +
                              ' (default: resnet18)')
-    parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
-                        help='number of data loading workers (default: 4)')
-    parser.add_argument('--epochs', default=20, type=int, metavar='N',
-                        help='number of total epochs to run')
+    parser.add_argument('--bottleneck-dim', default=256, type=int,
+                        help='Dimension of bottleneck')
+    parser.add_argument('--threshold', default=0.8, type=float,
+                        help='When class confidence is less than the given threshold, '
+                             'model will output "unknown" (default: 0.5)')
+    parser.add_argument('--trade-off', default=1., type=float,
+                        help='the trade-off hyper-parameter for transfer loss')
+    # training parameters
     parser.add_argument('-b', '--batch-size', default=32, type=int,
                         metavar='N',
                         help='mini-batch size (default: 32)')
@@ -267,20 +313,23 @@ if __name__ == '__main__':
     parser.add_argument('--wd', '--weight-decay',default=1e-3, type=float,
                         metavar='W', help='weight decay (default: 1e-3)',
                         dest='weight_decay')
+    parser.add_argument('-j', '--workers', default=2, type=int, metavar='N',
+                        help='number of data loading workers (default: 4)')
+    parser.add_argument('--epochs', default=20, type=int, metavar='N',
+                        help='number of total epochs to run')
+    parser.add_argument('-i', '--iters-per-epoch', default=500, type=int,
+                        help='Number of iterations per epoch')
     parser.add_argument('-p', '--print-freq', default=100, type=int,
                         metavar='N', help='print frequency (default: 100)')
     parser.add_argument('--seed', default=None, type=int,
                         help='seed for initializing training. ')
-    parser.add_argument('--trade-off', default=1., type=float,
-                        help='the trade-off hyper-parameter for transfer loss')
-    parser.add_argument('-i', '--iters-per-epoch', default=500, type=int,
-                        help='Number of iterations per epoch')
-    parser.add_argument('--bottleneck-dim', default=256, type=int,
-                        help='Dimension of bottleneck')
-    parser.add_argument('--threshold', default=0.8, type=float,
-                        help='When class confidence is less than the given threshold, '
-                             'model will output "unknown" (default: 0.5)')
-
+    parser.add_argument('--per-class-eval', action='store_true',
+                        help='whether output per-class accuracy during evaluation')
+    parser.add_argument("--log", type=str, default='dann',
+                        help="Where to save logs, checkpoints and debugging images.")
+    parser.add_argument("--phase", type=str, default='train', choices=['train', 'test', 'analysis'],
+                        help="When phase is 'test', only test the model."
+                             "When phase is 'analysis', only analysis the model.")
     args = parser.parse_args()
     print(args)
     main(args)
