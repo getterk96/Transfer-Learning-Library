@@ -31,26 +31,6 @@ from dalib.utils.logger import CompleteLogger
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class Cos_Classifier(nn.Module):
-    def __init__(self, in_dims, out_dims, scale=4):
-        super(Cos_Classifier, self).__init__()
-        self.in_dims = in_dims
-        self.out_dims = out_dims
-        self.scale = scale
-        self.weight = Parameter(torch.Tensor(out_dims, in_dims).cuda())
-        self.reset_parameters()
-        print(f'Cosine Classifier Using Scale: {self.scale}')
-
-    def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
-
-    def forward(self, input, *args):
-        eps = 1e-7
-        ex = input / (torch.norm(input, 2, 1, keepdim=True) + eps)
-        ew = self.weight / (torch.norm(self.weight, 2, 1, keepdim=True) + eps)
-        return torch.mm(self.scale * ex, ew.t())
-
 def main(args: argparse.Namespace):
     logger = CompleteLogger(args.log, args.phase)
 
@@ -105,34 +85,29 @@ def main(args: argparse.Namespace):
 
     # create model
     num_classes = train_source_dataset.num_classes
-    model = models.__dict__[args.arch](num_classes=num_classes).to(device)
-    discriminator = Discriminator(num_classes=num_classes).to(device)
+    model = models.__dict__[args.arch](num_classes=num_classes)
 
     # define optimizer and lr scheduler
     optimizer = SGD(model.get_parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    optimizer_d = Adam(discriminator.parameters(), lr=args.lr_d, betas=(0.9, 0.99))
     lr_scheduler = LambdaLR(optimizer, lambda x: args.lr * (1. - float(x) / args.epochs / args.iters_per_epoch) ** (args.lr_power))
-    lr_scheduler_d = LambdaLR(optimizer_d, lambda x: (1. - float(x) / args.epochs / args.iters_per_epoch) ** (args.lr_power))
 
     # optionally resume from a checkpoint
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         model.load_state_dict(checkpoint['model'])
-        discriminator.load_state_dict(checkpoint['discriminator'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-        optimizer_d.load_state_dict(checkpoint['optimizer_d'])
-        lr_scheduler_d.load_state_dict(checkpoint['lr_scheduler_d'])
         args.start_epoch = checkpoint['epoch'] + 1
 
     # define loss function (criterion)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=args.ignore_label).to(device)
-    dann = DomainAdversarialEntropyLoss(discriminator)
     interp_train = nn.Upsample(size=args.train_size[::-1], mode='bilinear', align_corners=True)
     interp_val = nn.Upsample(size=args.test_output_size[::-1], mode='bilinear', align_corners=True)
 
     # define visualization function
     decode = train_source_dataset.decode_target
+
+    model = nn.DataParallel(model).to(device)
 
     def visualize(image, pred, label, prefix):
         """
@@ -160,11 +135,12 @@ def main(args: argparse.Namespace):
     # start training
     best_iou = 0.
     for epoch in range(args.start_epoch, args.epochs):
+        stage = epoch / args.epochs
         logger.set_epoch(epoch)
-        print(lr_scheduler.get_lr(), lr_scheduler_d.get_lr())
+        print(lr_scheduler.get_lr())
         # train for one epoch
-        train(train_source_iter, train_target_iter, model, interp_train, criterion, dann, optimizer,
-              lr_scheduler, optimizer_d, lr_scheduler_d, epoch, visualize if args.debug else None, args)
+        train(train_source_iter, train_target_iter, model, interp_train, criterion, optimizer,
+              lr_scheduler, epoch, visualize if args.debug else None, args, stage)
 
         # evaluate on validation set
         confmat = validate(val_target_loader, model, interp_val, criterion, None, args)
@@ -181,11 +157,8 @@ def main(args: argparse.Namespace):
         torch.save(
             {
                 'model': model.state_dict(),
-                'discriminator': discriminator.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'optimizer_d': optimizer_d.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
-                'lr_scheduler_d': lr_scheduler_d.state_dict(),
                 'epoch': epoch,
                 'args': args
             }, logger.get_checkpoint_path(epoch)
@@ -198,26 +171,72 @@ def main(args: argparse.Namespace):
     logger.close()
 
 
-def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator,
-          model, interp, criterion, dann,
-          optimizer: SGD, lr_scheduler: LambdaLR, optimizer_d: SGD, lr_scheduler_d: LambdaLR,
-          epoch: int, visualize, args: argparse.Namespace):
+def get_pseudo_examples(ori_pred_t: torch.Tensor, threshold, stage): # shape: 2 * 19 * 512 * 1024
+    pred_t = ori_pred_t.permute(0, 2, 3, 1).contiguous()
+    pred_t = pred_t.view(-1, pred_t.shape[-1])
+    conf_t, pseudo_label_t = pred_t.max(dim=1)
+
+    conf_t, idx = torch.sort(conf_t, descending=True)
+    l = len(pseudo_label_t)
+
+    if stage < 0.5:
+        threshold /= 2
+    idx = idx[:int(threshold * l)]
+    pseudo_label_t = pseudo_label_t[idx]
+
+    return pred_t[idx], pseudo_label_t
+
+def get_balanced_examples(scores, target, stage):
+    if stage < 0.5:
+        return scores, target
+
+    if len(scores.shape) == 4:
+        scores = scores.permute(0, 2, 3, 1).contiguous().view(-1, 19)
+        target = target.view(-1)
+
+    total = 2 * 512 * 1024
+    target_distribution = []
+    for i in range(19):
+        idx = torch.where(target == i)[0].cpu().numpy()
+        np.random.shuffle(idx)
+        target_distribution.append(idx)
+
+    valid_classes = []
+    idxs = [0] * 19
+    lens = [0] * 19
+    for i in range(19):
+        l = target_distribution[i].size
+        if l:
+            valid_classes.append(i)
+            lens[i] = l
+
+    nidx = [0] * total
+    class_choices = np.array(valid_classes).repeat(total // len(valid_classes) + 1)
+    np.random.shuffle(class_choices)
+    for i in range(total):
+        class_id = class_choices[i]
+        nidx[i] = target_distribution[class_id][idxs[class_id]]
+        idxs[class_id] = (idxs[class_id] + 1) % lens[class_id]
+
+    return scores[nidx], target[nidx]
+
+def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverDataIterator, model, interp, criterion,
+          optimizer: SGD, lr_scheduler: LambdaLR, epoch: int, visualize, args: argparse.Namespace, stage):
+    threshold = args.threshold
     batch_time = AverageMeter('Time', ':4.2f')
     data_time = AverageMeter('Data', ':3.1f')
     losses_s = AverageMeter('Loss (s)', ':3.2f')
-    losses_transfer = AverageMeter('Loss (transfer)', ':3.2f')
-    losses_discriminator = AverageMeter('Loss (discriminator)', ':3.2f')
+    losses_t = AverageMeter('Loss (selftraining)', ':3.2f')
     accuracies_s = Meter('Acc (s)', ':3.2f')
     accuracies_t = Meter('Acc (t)', ':3.2f')
     iou_s = Meter('IoU (s)', ':3.2f')
     iou_t = Meter('IoU (t)', ':3.2f')
 
-    confmat_s = ConfusionMatrix(model.num_classes)
-    confmat_t = ConfusionMatrix(model.num_classes)
+    confmat_s = ConfusionMatrix(model.module.num_classes)
+    confmat_t = ConfusionMatrix(model.module.num_classes)
     progress = ProgressMeter(
         args.iters_per_epoch,
-        [batch_time, data_time, losses_s, losses_transfer, losses_discriminator,
-         accuracies_s, accuracies_t, iou_s, iou_t],
+        [batch_time, data_time, losses_s, losses_t, accuracies_s, accuracies_t, iou_s, iou_t],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
@@ -232,45 +251,37 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         x_s = x_s.to(device)
         label_s = label_s.long().to(device)
         x_t = x_t.to(device)
-        label_t = label_t.long().to(device)
+        ori_label_t = label_t.long().to(device)
 
         # measure data loading time
         data_time.update(time.time() - end)
 
         optimizer.zero_grad()
-        optimizer_d.zero_grad()
 
         # Step 1: Train the segmentation network, freeze the discriminator
-        dann.eval()
         y_s = model(x_s)
         pred_s = interp(y_s)
+        pred_s, label_s = get_balanced_examples(pred_s, label_s, stage)
         loss_cls_s = criterion(pred_s, label_s)
         loss_cls_s.backward()
 
         # adversarial training to fool the discriminator
         y_t = model(x_t)
-        pred_t = interp(y_t)
-        loss_transfer = dann(pred_t, 'source')
-        (loss_transfer * args.trade_off).backward()
-
-        # Step 2: Train the discriminator
-        dann.train()
-        loss_discriminator = 0.5 * (dann(pred_s.detach(), 'source') + dann(pred_t.detach(), 'target'))
-        loss_discriminator.backward()
+        ori_pred_t = interp(y_t)
+        pred_t, label_t = get_pseudo_examples(ori_pred_t, threshold, stage)
+        # pred_t, label_t = get_balanced_examples(pred_t, label_t, stage)
+        loss_cls_t = criterion(pred_t, label_t)
+        loss_cls_t.backward()
 
         # compute gradient and do SGD step
         optimizer.step()
-        optimizer_d.step()
         lr_scheduler.step()
-        lr_scheduler_d.step()
 
         # measure accuracy and record loss
         losses_s.update(loss_cls_s.item(), x_s.size(0))
-        losses_transfer.update(loss_transfer.item(), x_s.size(0))
-        losses_discriminator.update(loss_discriminator.item(), x_s.size(0))
-
+        losses_t.update(loss_cls_t.item(), x_t.size(0))
         confmat_s.update(label_s.flatten(), pred_s.argmax(1).flatten())
-        confmat_t.update(label_t.flatten(), pred_t.argmax(1).flatten())
+        confmat_t.update(ori_label_t.flatten(), ori_pred_t.argmax(1).flatten())
         acc_global_s, acc_s, iu_s = confmat_s.compute()
         acc_global_t, acc_t, iu_t = confmat_t.compute()
         accuracies_s.update(acc_s.mean().item())
@@ -287,7 +298,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
 
             if visualize is not None:
                 visualize(x_s[0], pred_s[0], label_s[0], "source_{}".format(i))
-                visualize(x_t[0], pred_t[0], label_t[0], "target_{}".format(i))
+                visualize(x_t[0], pred_t[0], ori_label_t[0], "target_{}".format(i))
 
 
 def validate(val_loader: DataLoader, model, interp, criterion, visualize, args: argparse.Namespace):
@@ -370,7 +381,7 @@ if __name__ == '__main__':
     parser.add_argument('--trade-off', type=float, default=0.001,
                         help='trade-off parameter for the advent loss')
     # training parameters
-    parser.add_argument('-b', '--batch-size', default=2, type=int,
+    parser.add_argument('-b', '--batch-size', default=12, type=int,
                         metavar='N',
                         help='mini-batch size (default: 2)')
     parser.add_argument('--lr', '--learning-rate', default=2.5e-3, type=float,
@@ -383,19 +394,21 @@ if __name__ == '__main__':
                         metavar='LR', help='initial learning rate for discriminator')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
-    parser.add_argument('--epochs', default=60, type=int, metavar='N',
+    parser.add_argument('--epochs', default=40, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('-i', '--iters-per-epoch', default=2500, type=int,
                         help='Number of iterations per epoch')
-    parser.add_argument('-p', '--print-freq', default=100, type=int,
-                        metavar='N', help='print frequency (default: 100)')
+    parser.add_argument('-p', '--print-freq', default=50, type=int,
+                        metavar='N', help='print frequency (default: 50)')
     parser.add_argument('--seed', default=None, type=int,
                         help='seed for initializing training. ')
     parser.add_argument("--ignore-label", type=int, default=255,
                         help="The index of the label to ignore during the training.")
-    parser.add_argument("--log", type=str, default='advent',
+    parser.add_argument("--threshold", type=float, default=0.2,
+                        help="The threshold for pseudo example selecting.")
+    parser.add_argument("--log", type=str, default='rebalselftraining',
                         help="Where to save logs, checkpoints and debugging images.")
     parser.add_argument("--phase", type=str, default='train', choices=['train', 'test'],
                         help="When phase is 'test', only test the model.")

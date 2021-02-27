@@ -1,0 +1,2 @@
+#CUDA_VISIBLE_DEVICES=3 python rebalselftraining.py /data/GTA-5 /data/cityscapes -s GTA5 -t Cityscapes --log logs/rebalselftraining/gtav2cityscapes_resume_half --resume /home/gaojinghan/Transfer-Learning-Library/examples-da/segmentation/logs/rebalselftraining/gtav2cityscapes/checkpoints/19.pth
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python rebalselftraining.py /data/GTA-5 /data/cityscapes -s GTA5_6 -t Cityscapes --log logs/rebalselftraining/gtav2cityscapes
