@@ -85,7 +85,7 @@ def main(args: argparse.Namespace):
 
     # create model
     num_classes = train_source_dataset.num_classes
-    model = models.__dict__[args.arch](num_classes=num_classes)
+    model = models.__dict__[args.arch](num_classes=num_classes).to(device)
 
     # define optimizer and lr scheduler
     optimizer = SGD(model.get_parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
@@ -94,7 +94,7 @@ def main(args: argparse.Namespace):
     # optionally resume from a checkpoint
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model.module.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         args.start_epoch = checkpoint['epoch'] + 1
@@ -106,8 +106,6 @@ def main(args: argparse.Namespace):
 
     # define visualization function
     decode = train_source_dataset.decode_target
-
-    model = nn.DataParallel(model).to(device)
 
     def visualize(image, pred, label, prefix):
         """
@@ -156,7 +154,7 @@ def main(args: argparse.Namespace):
         # remember best acc@1 and save checkpoint
         torch.save(
             {
-                'model': model.module.state_dict(),
+                'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'epoch': epoch,
@@ -170,11 +168,9 @@ def main(args: argparse.Namespace):
 
     logger.close()
 
-
 conf_conv = nn.Conv2d(1, 1, (9, 9), padding=4, padding_mode='replicate').cuda()
 conf_conv.requires_grad_(False)
 nn.init.constant_(conf_conv.weight, 1)
-
 
 def get_pseudo_examples(ori_pred_t: torch.Tensor, threshold, stage): # shape: 2 * 19 * 512 * 1024
     conf_t, pseudo_label_t = ori_pred_t.detach().max(dim=1, keepdim=True)
@@ -193,7 +189,7 @@ def get_pseudo_examples(ori_pred_t: torch.Tensor, threshold, stage): # shape: 2 
 
     return ori_pred_t.permute(0, 2, 3, 1).contiguous().view(-1, 19)[idx], pseudo_label_t[idx]
 
-def get_balanced_examples(scores, target, stage):
+def get_bal_examples(scores, target, stage):
     if stage < 0.5:
         return scores, target
 
@@ -239,8 +235,8 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
     iou_s = Meter('IoU (s)', ':3.2f')
     iou_t = Meter('IoU (t)', ':3.2f')
 
-    confmat_s = ConfusionMatrix(model.module.num_classes)
-    confmat_t = ConfusionMatrix(model.module.num_classes)
+    confmat_s = ConfusionMatrix(model.num_classes)
+    confmat_t = ConfusionMatrix(model.num_classes)
     progress = ProgressMeter(
         args.iters_per_epoch,
         [batch_time, data_time, losses_s, losses_t, accuracies_s, accuracies_t, iou_s, iou_t],
@@ -255,9 +251,6 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         x_s, label_s = next(train_source_iter)
         x_t, label_t = next(train_target_iter)
 
-        x_s = torch.cat(x_s, dim=0)
-        label_s = torch.cat(label_s, dim=0)
-
         x_s = x_s.to(device)
         label_s = label_s.long().to(device)
         x_t = x_t.to(device)
@@ -271,7 +264,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         # Step 1: Train the segmentation network, freeze the discriminator
         y_s = model(x_s)
         pred_s = interp(y_s)
-        pred_s, label_s = get_balanced_examples(pred_s, label_s, stage)
+        # pred_s, label_s = get_bal_examples(pred_s, label_s, stage)
         loss_cls_s = criterion(pred_s, label_s)
         loss_cls_s.backward()
 
@@ -323,7 +316,7 @@ def validate(val_loader: DataLoader, model, interp, criterion, visualize, args: 
 
     # switch to evaluate mode
     model.eval()
-    confmat = ConfusionMatrix(model.module.num_classes)
+    confmat = ConfusionMatrix(model.num_classes)
 
     with torch.no_grad():
         end = time.time()
@@ -402,9 +395,9 @@ if __name__ == '__main__':
                         help="Decay parameter to compute the learning rate (only for deeplab).")
     parser.add_argument("--lr-d", default=1e-4, type=float,
                         metavar='LR', help='initial learning rate for discriminator')
-    parser.add_argument('-j', '--workers', default=12, type=int, metavar='N',
+    parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
-    parser.add_argument('--epochs', default=20, type=int, metavar='N',
+    parser.add_argument('--epochs', default=30, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')

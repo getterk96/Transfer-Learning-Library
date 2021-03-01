@@ -80,13 +80,13 @@ class GTA5_6(SegmentationList):
     def __getitem__(self, index):
         image_name = self.data_list[index]
         label_name = self.label_list[index]
-        image = Image.open(os.path.join(self.root, self.data_folder, image_name)).convert('RGB')
-        label = Image.open(os.path.join(self.root, self.label_folder, label_name))
+        ori_image = Image.open(os.path.join(self.root, self.data_folder, image_name)).convert('RGB')
+        ori_label = Image.open(os.path.join(self.root, self.label_folder, label_name))
 
         images = []
         labels = []
         for i in range(6):
-            image, label = self.transforms(image, label)
+            image, label = self.transforms(ori_image, ori_label)
 
             # remap label
             if isinstance(label, torch.Tensor):
