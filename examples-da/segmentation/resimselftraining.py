@@ -63,11 +63,15 @@ def main(args: argparse.Namespace):
     target_dataset = datasets.__dict__[args.target]
     train_target_dataset = target_dataset(
         root=args.target_root,
+        pre_transforms=T.Compose([
+            T.Resize(image_size=args.test_input_size, label_size=args.test_output_size),
+            T.NormalizeAndTranspose(),
+        ]),
         transforms=T.Compose([
             T.RandomResizedCrop(size=args.train_size, ratio=(2., 2.), scale=(0.5, 1.)),
             T.RandomHorizontalFlip(),
             T.NormalizeAndTranspose(),
-        ]),
+        ])
     )
     train_target_loader = DataLoader(train_target_dataset, batch_size=args.batch_size,
                                      shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
