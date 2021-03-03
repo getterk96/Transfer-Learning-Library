@@ -62,7 +62,8 @@ def main(args: argparse.Namespace):
     train_target_dataset = target_dataset(
         root=args.target_root,
         transforms=T.Compose([
-            T.Resize(image_size=args.train_size, label_size=args.train_size),
+            T.RandomResizedCrop(size=args.train_size, ratio=(2., 2.), scale=(0.5, 1.)),
+            T.RandomHorizontalFlip(),
             T.NormalizeAndTranspose(),
         ])
     )
@@ -91,7 +92,7 @@ def main(args: argparse.Namespace):
 
     # optionally resume from a checkpoint
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -183,9 +184,10 @@ def get_pseudo_confs(ori_pred_t: torch.Tensor):  # shape: 2 * 19 * 512 * 1024
     return conf_t.cpu().squeeze(), pseudo_label_t.cpu().squeeze()
 
 
-def get_pseudo_examples(npred_t: torch.Tensor, nconf_t: torch.Tensor, npseudo_label_t: torch.Tensor, threshold, stage): # shape: 2 * 19 * 512 * 1024
+def get_pseudo_examples(npred_t: torch.Tensor, nconf_t: torch.Tensor, npseudo_label_t: torch.Tensor, label_t, threshold, stage): # shape: 2 * 19 * 512 * 1024
     nconf_t = nconf_t.contiguous().view(-1)
     npseudo_label_t = npseudo_label_t.long().contiguous().view(-1)
+    label_t = label_t.contiguous().view(-1)
 
     nconf_t, nidx = torch.sort(nconf_t, descending=True)
     l = len(npseudo_label_t)
@@ -194,10 +196,10 @@ def get_pseudo_examples(npred_t: torch.Tensor, nconf_t: torch.Tensor, npseudo_la
         threshold /= 2
     nidx = nidx[:int(threshold * l)]
 
-    return npred_t.permute(0, 2, 3, 1).contiguous().view(-1, 19)[nidx], npseudo_label_t[nidx]
+    return npred_t.permute(0, 2, 3, 1).contiguous().view(-1, 19)[nidx], npseudo_label_t[nidx], (npseudo_label_t[nidx] == label_t.cpu()[nidx]).sum().item() / len(nidx)
 
 
-def additional_transform(input, conf, target):
+def additional_transform(input, conf, target, label):
     i, j, h, w = transforms.RandomResizedCrop.get_params(input, scale=[0.5, 1.], ratio=[2., 2.])
     input = F.crop(input, i, j, h, w)
     input = F.resize(input, size=args.train_size)
@@ -205,11 +207,14 @@ def additional_transform(input, conf, target):
     conf = F.resize(conf, size=args.train_size, interpolation=Image.NEAREST)
     target = F.crop(target, i, j, h, w)
     target = F.resize(target, size=args.train_size, interpolation=Image.NEAREST)
+    label = F.crop(label, i, j, h, w)
+    label = F.resize(label, size=args.train_size, interpolation=Image.NEAREST)
     if random.random() > 0.5:
         input = F.hflip(input)
         conf = F.hflip(conf)
         target = F.hflip(target)
-    return input, conf, target
+        label = F.hflip(label)
+    return input, conf, target, label
 
 def get_bal_examples(scores, target, stage):
     if stage < 0.5:
@@ -255,6 +260,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
     losses_t = AverageMeter('Loss (selftraining)', ':3.2f')
     accuracies_s = Meter('Acc (s)', ':3.2f')
     accuracies_t = Meter('Acc (t)', ':3.2f')
+    accuracies_p = Meter('Acc (p)', ':3.2f')
     iou_s = Meter('IoU (s)', ':3.2f')
     iou_t = Meter('IoU (t)', ':3.2f')
 
@@ -262,7 +268,7 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
     confmat_t = ConfusionMatrix(model.num_classes)
     progress = ProgressMeter(
         args.iters_per_epoch,
-        [batch_time, data_time, losses_s, losses_t, accuracies_s, accuracies_t, iou_s, iou_t],
+        [batch_time, data_time, losses_s, losses_t, accuracies_s, accuracies_t, accuracies_p, iou_s, iou_t],
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
@@ -292,16 +298,17 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         loss_cls_s.backward()
 
         # adversarial training to fool the discriminator
-        with torch.no_grad():
-            y_t = model(x_t)
-            pred_t = interp(y_t)
-        conf_t, pseudo_label_t = get_pseudo_confs(pred_t)
-        nx_t, nconf_t, npseudo_label_t = additional_transform(x_t, conf_t, pseudo_label_t)
-        ny_t = model(nx_t)
-        npred_t = interp(ny_t)
-        npred_t, nlabel_t = get_pseudo_examples(npred_t, nconf_t, npseudo_label_t, threshold, stage)
-        loss_cls_t = criterion(npred_t, nlabel_t.to(device))
-        loss_cls_t.backward()
+        for _ in range(6):
+            with torch.no_grad():
+                y_t = model(x_t)
+                pred_t = interp(y_t)
+            conf_t, pseudo_label_t = get_pseudo_confs(pred_t)
+            nx_t, nconf_t, npseudo_label_t, nlabel_t = additional_transform(x_t, conf_t, pseudo_label_t, ori_label_t)
+            ny_t = model(nx_t)
+            npred_t = interp(ny_t)
+            npred_t, npseudo_l_t, acc_p = get_pseudo_examples(npred_t, nconf_t, npseudo_label_t, nlabel_t, threshold, stage)
+            loss_cls_t = criterion(npred_t, npseudo_l_t.to(device))
+            loss_cls_t.backward()
 
         # compute gradient and do SGD step
         optimizer.step()
@@ -311,11 +318,12 @@ def train(train_source_iter: ForeverDataIterator, train_target_iter: ForeverData
         losses_s.update(loss_cls_s.item(), x_s.size(0))
         losses_t.update(loss_cls_t.item(), x_t.size(0))
         confmat_s.update(label_s.flatten(), pred_s.argmax(1).flatten())
-        confmat_t.update(ori_label_t.flatten(), pred_t.argmax(1).flatten())
+        confmat_t.update(nlabel_t.cpu().flatten(), npseudo_label_t.flatten())
         acc_global_s, acc_s, iu_s = confmat_s.compute()
         acc_global_t, acc_t, iu_t = confmat_t.compute()
         accuracies_s.update(acc_s.mean().item())
         accuracies_t.update(acc_t.mean().item())
+        accuracies_p.update(acc_p)
         iou_s.update(iu_s.mean().item())
         iou_t.update(iu_t.mean().item())
 
@@ -424,19 +432,19 @@ if __name__ == '__main__':
                         metavar='LR', help='initial learning rate for discriminator')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
-    parser.add_argument('--epochs', default=20, type=int, metavar='N',
+    parser.add_argument('--epochs', default=30, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('-i', '--iters-per-epoch', default=2500, type=int,
                         help='Number of iterations per epoch')
-    parser.add_argument('-p', '--print-freq', default=50, type=int,
+    parser.add_argument('-p', '--print-freq', default=10, type=int,
                         metavar='N', help='print frequency (default: 50)')
     parser.add_argument('--seed', default=None, type=int,
                         help='seed for initializing training. ')
     parser.add_argument("--ignore-label", type=int, default=255,
                         help="The index of the label to ignore during the training.")
-    parser.add_argument("--threshold", type=float, default=0.2,
+    parser.add_argument("--threshold", type=float, default=0.1,
                         help="The threshold for pseudo example selecting.")
     parser.add_argument("--log", type=str, default='rebalselftraining',
                         help="Where to save logs, checkpoints and debugging images.")
