@@ -42,7 +42,7 @@ class GTA5(SegmentationList):
         super(GTA5, self).__init__(root, Cityscapes.CLASSES, data_list_file, data_list_file, data_folder, label_folder,
                                    id_to_train_id=Cityscapes.ID_TO_TRAIN_ID, train_id_to_color=Cityscapes.TRAIN_ID_TO_COLOR, **kwargs)
 
-class GTA5_5(SegmentationList):
+class GTA5_6(SegmentationList):
     """`GTA5 <https://download.visinf.tu-darmstadt.de/data/from_games/>`_
 
     Args:
@@ -72,7 +72,7 @@ class GTA5_5(SegmentationList):
         list(map(lambda args: download_data(root, *args), self.download_list))
         data_list_file = os.path.join(root, "image_list", "{}.txt".format(split))
         self.split = split
-        super(GTA5_5, self).__init__(root, Cityscapes.CLASSES, data_list_file, data_list_file, data_folder,
+        super(GTA5_6, self).__init__(root, Cityscapes.CLASSES, data_list_file, data_list_file, data_folder,
                                    label_folder,
                                    id_to_train_id=Cityscapes.ID_TO_TRAIN_ID,
                                    train_id_to_color=Cityscapes.TRAIN_ID_TO_COLOR, **kwargs)
@@ -85,7 +85,7 @@ class GTA5_5(SegmentationList):
 
         images = []
         labels = []
-        for i in range(5):
+        for i in range(6):
             image, label = self.transforms(ori_image, ori_label)
 
             # remap label
